@@ -14,6 +14,7 @@ const ROOM_META_KEY = "room:meta";
 const CLIENT_KEY_PREFIX = "client:";
 const DISCONNECT_TIMEOUT_MS = 90_000;
 const MAX_CACHED_SIGNALS = 256;
+const SIGNALING_PROTOCOL_VERSION = 2;
 
 interface RoomMeta {
   passwordHash: string | null;
@@ -225,6 +226,7 @@ export class SignalingRoom extends DurableObject<Env> {
     if (existing?.socket === socket) {
       existing.client = client;
       await this.persistClient(existing);
+      this.acknowledgeJoin(socket, client.resume === true);
       return;
     }
 
@@ -245,6 +247,7 @@ export class SignalingRoom extends DurableObject<Env> {
       socket.serializeAttachment({ clientId: client.clientId });
       await this.persistClient(resumed);
       await this.scheduleNextAlarm();
+      this.acknowledgeJoin(socket, true);
 
       for (const cachedSignal of cachedSignals) {
         this.send(socket, cachedSignal);
@@ -267,13 +270,7 @@ export class SignalingRoom extends DurableObject<Env> {
       );
     }
 
-    for (const state of this.clients.values()) {
-      this.send(socket, {
-        type: "join",
-        data: state.client,
-      });
-    }
-
+    const currentClients = [...this.clients.values()];
     const joined: ClientState = {
       client,
       socket,
@@ -284,6 +281,16 @@ export class SignalingRoom extends DurableObject<Env> {
     this.clients.set(client.clientId, joined);
     socket.serializeAttachment({ clientId: client.clientId });
     await this.persistClient(joined);
+    await this.scheduleNextAlarm();
+    this.acknowledgeJoin(socket, false);
+
+    for (const state of currentClients) {
+      this.send(socket, {
+        type: "join",
+        data: state.client,
+      });
+    }
+
     await this.broadcast(
       {
         type: "join",
@@ -291,7 +298,6 @@ export class SignalingRoom extends DurableObject<Env> {
       },
       socket,
     );
-    await this.scheduleNextAlarm();
   }
 
   private async handleClientMessage(
@@ -419,6 +425,16 @@ export class SignalingRoom extends DurableObject<Env> {
     } catch (error) {
       console.warn("Failed to send signal", error);
     }
+  }
+
+  private acknowledgeJoin(socket: WebSocket, resumed: boolean): void {
+    this.send(socket, {
+      type: "joined",
+      data: {
+        protocolVersion: SIGNALING_PROTOCOL_VERSION,
+        resumed,
+      },
+    });
   }
 
   private sendError(socket: WebSocket, message: string): void {

@@ -87,9 +87,17 @@ async function connect(
   return { inbox, stub };
 }
 
-async function join(inbox: SocketInbox, value: unknown): Promise<void> {
+async function join(inbox: SocketInbox, value: unknown): Promise<RawSignal> {
   inbox.send({ type: "join", data: value });
-  await Promise.resolve();
+  const acknowledgement = await inbox.next();
+  expect(acknowledgement).toMatchObject({
+    type: "joined",
+    data: {
+      protocolVersion: 2,
+      resumed: expect.any(Boolean),
+    },
+  });
+  return acknowledgement;
 }
 
 async function waitForStoredStatus(
@@ -275,13 +283,16 @@ describe("SignalingRoom", () => {
 
     const resumedBob = await connect(roomId);
     await resumedBob.inbox.next();
-    await join(
+    const acknowledgement = await join(
       resumedBob.inbox,
       client("bob", {
         resume: true,
         createdAt: Date.now() + 1,
       }),
     );
+    expect(acknowledgement.data).toMatchObject({
+      resumed: true,
+    });
     expect(await resumedBob.inbox.next()).toEqual({
       type: "message",
       data: {

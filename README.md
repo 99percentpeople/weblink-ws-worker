@@ -15,11 +15,16 @@ The Worker handles only room membership and the signaling needed to establish
 WebRTC connections:
 
 - room password metadata
-- `connected`, `join`, and `leave` events
+- `connected`, `join`, versioned `joined`, and `leave` events
 - SDP offer/answer and ICE candidate forwarding
 - same-client reconnects with a 90-second grace period
 - queued signaling messages during that reconnect period
 - hibernatable WebSockets and alarm-based cleanup
+
+The Worker emits `joined` with signaling protocol version 2 and a `resumed`
+flag after membership is stored and before presence or cached signaling is
+replayed. This gives clients an explicit point at which the replacement socket
+is safe to use.
 
 Each room ID maps to one Durable Object, which keeps room state isolated and
 provides a single serialization point for membership changes.
@@ -61,6 +66,8 @@ bun run dev
 
 The `ROOMS` Durable Object binding, SQLite-backed class export, Workers.dev
 endpoint, and `ws.webl.ink` custom domain are declared in `wrangler.jsonc`.
+Cloudflare Workers Traces are persisted with a 1% head sampling rate to keep
+production observability lightweight.
 
 For a local desktop session:
 
