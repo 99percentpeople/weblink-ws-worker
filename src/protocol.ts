@@ -19,8 +19,12 @@ export interface ClientSignal extends RawSignal {
   targetClientId: ClientID;
 }
 
+export const SIGNALING_PROTOCOL_VERSION = 2;
 export const MAX_CLIENT_ID_LENGTH = 128;
+export const MAX_ROOM_ID_LENGTH = 256;
+export const MAX_PASSWORD_HASH_LENGTH = 1024;
 export const MAX_SIGNAL_MESSAGE_BYTES = 1024 * 1024;
+export const MAX_CACHED_SIGNALS = 256;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -85,4 +89,14 @@ export function parseRawSignal(message: string): RawSignal {
 
 export function encodedMessageSize(message: string): number {
   return new TextEncoder().encode(message).byteLength;
+}
+
+export function createJoinAcknowledgement(resumed: boolean): RawSignal {
+  return {
+    type: "joined",
+    data: {
+      protocolVersion: SIGNALING_PROTOCOL_VERSION,
+      resumed,
+    },
+  };
 }

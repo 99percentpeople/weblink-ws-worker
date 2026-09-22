@@ -1,6 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  createJoinAcknowledgement,
   encodedMessageSize,
+  MAX_CACHED_SIGNALS,
   MAX_SIGNAL_MESSAGE_BYTES,
   parseClientSignal,
   parseRawSignal,
@@ -13,8 +15,6 @@ import {
 const ROOM_META_KEY = "room:meta";
 const CLIENT_KEY_PREFIX = "client:";
 const DISCONNECT_TIMEOUT_MS = 90_000;
-const MAX_CACHED_SIGNALS = 256;
-const SIGNALING_PROTOCOL_VERSION = 2;
 
 interface RoomMeta {
   passwordHash: string | null;
@@ -25,6 +25,7 @@ interface StoredClientState {
   status: "active" | "disconnected";
   expiresAt: number | null;
   messageCache: RawSignal[];
+  connectionId?: string;
 }
 
 interface ClientState extends StoredClientState {
@@ -33,6 +34,7 @@ interface ClientState extends StoredClientState {
 
 interface SocketAttachment {
   clientId?: ClientID;
+  connectionId?: string;
 }
 
 export class SignalingRoom extends DurableObject<Env> {
@@ -106,6 +108,10 @@ export class SignalingRoom extends DurableObject<Env> {
       this.clients.set(clientId, {
         ...stored,
         client,
+        connectionId:
+          typeof stored.connectionId === "string"
+            ? stored.connectionId
+            : undefined,
         messageCache,
         socket: null,
       });
@@ -114,6 +120,7 @@ export class SignalingRoom extends DurableObject<Env> {
       await this.ctx.storage.delete(invalidClientKeys);
     }
 
+    const writes: Promise<void>[] = [];
     for (const socket of this.ctx.getWebSockets()) {
       const attachment =
         socket.deserializeAttachment() as SocketAttachment | null;
@@ -126,13 +133,35 @@ export class SignalingRoom extends DurableObject<Env> {
         continue;
       }
 
+      const connectionId =
+        attachment?.connectionId ?? state.connectionId ?? crypto.randomUUID();
+
+      if (
+        state.connectionId &&
+        attachment?.connectionId &&
+        state.connectionId !== attachment.connectionId
+      ) {
+        socket.close(1008, "Stale client session");
+        continue;
+      }
+
+      if (state.socket && state.socket !== socket) {
+        socket.close(1008, "Stale client session");
+        continue;
+      }
+
+      socket.serializeAttachment({
+        clientId,
+        connectionId,
+      } satisfies SocketAttachment);
+      state.connectionId = connectionId;
       state.socket = socket;
       state.status = "active";
       state.expiresAt = null;
+      writes.push(this.persistClient(state));
     }
 
     const now = Date.now();
-    const writes: Promise<void>[] = [];
     for (const state of this.clients.values()) {
       if (state.status === "active" && !state.socket) {
         state.status = "disconnected";
@@ -159,7 +188,9 @@ export class SignalingRoom extends DurableObject<Env> {
 
     const [client, server] = Object.values(new WebSocketPair());
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({} satisfies SocketAttachment);
+    server.serializeAttachment({
+      connectionId: crypto.randomUUID(),
+    } satisfies SocketAttachment);
     this.send(server, {
       type: "connected",
       data: this.roomMeta.passwordHash,
@@ -217,13 +248,20 @@ export class SignalingRoom extends DurableObject<Env> {
     }
 
     const attachment = this.getAttachment(socket);
-    if (attachment.clientId && attachment.clientId !== client.clientId) {
-      socket.close(1008, "Client ID cannot change");
-      return;
+    const connectionId = this.ensureConnectionId(socket);
+    if (attachment.clientId) {
+      if (attachment.clientId !== client.clientId) {
+        socket.close(1008, "Client ID cannot change");
+        return;
+      }
+      if (!this.currentClientState(socket)) {
+        socket.close(1008, "Stale client session");
+        return;
+      }
     }
 
     const existing = this.clients.get(client.clientId);
-    if (existing?.socket === socket) {
+    if (existing?.socket === socket && existing.connectionId === connectionId) {
       existing.client = client;
       await this.persistClient(existing);
       this.acknowledgeJoin(socket, client.resume === true);
@@ -239,12 +277,16 @@ export class SignalingRoom extends DurableObject<Env> {
       const resumed: ClientState = {
         client,
         socket,
+        connectionId,
         status: "active",
         expiresAt: null,
         messageCache: [],
       };
       this.clients.set(client.clientId, resumed);
-      socket.serializeAttachment({ clientId: client.clientId });
+      socket.serializeAttachment({
+        clientId: client.clientId,
+        connectionId,
+      } satisfies SocketAttachment);
       await this.persistClient(resumed);
       await this.scheduleNextAlarm();
       this.acknowledgeJoin(socket, true);
@@ -274,12 +316,16 @@ export class SignalingRoom extends DurableObject<Env> {
     const joined: ClientState = {
       client,
       socket,
+      connectionId,
       status: "active",
       expiresAt: null,
       messageCache: [],
     };
     this.clients.set(client.clientId, joined);
-    socket.serializeAttachment({ clientId: client.clientId });
+    socket.serializeAttachment({
+      clientId: client.clientId,
+      connectionId,
+    } satisfies SocketAttachment);
     await this.persistClient(joined);
     await this.scheduleNextAlarm();
     this.acknowledgeJoin(socket, false);
@@ -314,6 +360,10 @@ export class SignalingRoom extends DurableObject<Env> {
       this.sendError(socket, "Invalid client signal");
       return;
     }
+    if (!this.currentClientState(socket)) {
+      socket.close(1008, "Stale client session");
+      return;
+    }
 
     const target = this.clients.get(message.targetClientId);
     if (!target) return;
@@ -331,8 +381,8 @@ export class SignalingRoom extends DurableObject<Env> {
       return;
     }
 
-    const state = this.clients.get(clientId);
-    if (!state || state.socket !== socket) {
+    const state = this.currentClientState(socket);
+    if (!state) {
       socket.close(1000, "Left");
       return;
     }
@@ -352,8 +402,8 @@ export class SignalingRoom extends DurableObject<Env> {
       return;
     }
 
-    const state = this.clients.get(clientId);
-    if (!state || state.socket !== socket) {
+    const state = this.currentClientState(socket);
+    if (!state) {
       await this.cleanupEmptyRoom();
       return;
     }
@@ -428,13 +478,7 @@ export class SignalingRoom extends DurableObject<Env> {
   }
 
   private acknowledgeJoin(socket: WebSocket, resumed: boolean): void {
-    this.send(socket, {
-      type: "joined",
-      data: {
-        protocolVersion: SIGNALING_PROTOCOL_VERSION,
-        resumed,
-      },
-    });
+    this.send(socket, createJoinAcknowledgement(resumed));
   }
 
   private sendError(socket: WebSocket, message: string): void {
@@ -443,6 +487,36 @@ export class SignalingRoom extends DurableObject<Env> {
 
   private getAttachment(socket: WebSocket): SocketAttachment {
     return (socket.deserializeAttachment() as SocketAttachment | null) ?? {};
+  }
+
+  private ensureConnectionId(socket: WebSocket): string {
+    const attachment = this.getAttachment(socket);
+    if (attachment.connectionId) return attachment.connectionId;
+
+    const connectionId = crypto.randomUUID();
+    socket.serializeAttachment({
+      ...attachment,
+      connectionId,
+    } satisfies SocketAttachment);
+    return connectionId;
+  }
+
+  private currentClientState(socket: WebSocket): ClientState | null {
+    const attachment = this.getAttachment(socket);
+    if (!attachment.clientId || !attachment.connectionId) {
+      return null;
+    }
+
+    const state = this.clients.get(attachment.clientId);
+    if (
+      !state ||
+      state.socket !== socket ||
+      state.connectionId !== attachment.connectionId
+    ) {
+      return null;
+    }
+
+    return state;
   }
 
   private clientKey(clientId: ClientID): string {

@@ -1,9 +1,7 @@
 import { SignalingRoom } from "./signaling-room";
+import { MAX_PASSWORD_HASH_LENGTH, MAX_ROOM_ID_LENGTH } from "./protocol";
 
 export { SignalingRoom };
-
-const MAX_ROOM_ID_LENGTH = 256;
-const MAX_PASSWORD_HASH_LENGTH = 1024;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

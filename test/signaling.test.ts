@@ -226,6 +226,79 @@ describe("SignalingRoom", () => {
     });
   });
 
+  it("keeps the replacement socket authoritative over stale traffic", async () => {
+    const roomId = crypto.randomUUID();
+    const oldAlice = await connect(roomId);
+    const bob = await connect(roomId);
+    await oldAlice.inbox.next();
+    await bob.inbox.next();
+
+    await join(oldAlice.inbox, client("alice-owner"));
+    await join(bob.inbox, client("bob-owner"));
+    await bob.inbox.next();
+    await oldAlice.inbox.next();
+
+    const replacement = await connect(roomId);
+    await replacement.inbox.next();
+    const acknowledgement = await join(
+      replacement.inbox,
+      client("alice-owner", {
+        createdAt: Date.now() + 1,
+      }),
+    );
+    expect(acknowledgement.data).toMatchObject({
+      resumed: false,
+    });
+
+    expect(await bob.inbox.next()).toMatchObject({
+      type: "leave",
+      data: { clientId: "alice-owner" },
+    });
+    expect(await replacement.inbox.next()).toMatchObject({
+      type: "join",
+      data: { clientId: "bob-owner" },
+    });
+    expect(await bob.inbox.next()).toMatchObject({
+      type: "join",
+      data: { clientId: "alice-owner" },
+    });
+
+    try {
+      oldAlice.inbox.send({
+        type: "message",
+        data: {
+          type: "candidate",
+          clientId: "alice-owner",
+          targetClientId: "bob-owner",
+          data: "stale-candidate",
+        },
+      });
+      oldAlice.inbox.send({ type: "leave", data: null });
+    } catch {
+      // The replacement may already have completed the old socket close.
+    }
+
+    replacement.inbox.send({
+      type: "message",
+      data: {
+        type: "candidate",
+        clientId: "alice-owner",
+        targetClientId: "bob-owner",
+        data: "current-candidate",
+      },
+    });
+
+    expect(await bob.inbox.next()).toEqual({
+      type: "message",
+      data: {
+        type: "candidate",
+        clientId: "alice-owner",
+        targetClientId: "bob-owner",
+        data: "current-candidate",
+      },
+    });
+  });
+
   it("restores live sockets after hibernation", async () => {
     const roomId = crypto.randomUUID();
     const alice = await connect(roomId);
