@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   createJoinAcknowledgement,
+  createPeerOnline,
   encodedMessageSize,
   MAX_CACHED_SIGNALS,
   MAX_SIGNAL_MESSAGE_BYTES,
@@ -293,6 +294,18 @@ export class SignalingRoom extends DurableObject<Env> {
 
       for (const cachedSignal of cachedSignals) {
         this.send(socket, cachedSignal);
+      }
+      // Availability is ephemeral, not a peer leave/rejoin. Never cache it:
+      // an offline recipient recovers from its own acknowledged socket return.
+      const online = createPeerOnline(client.clientId, connectionId);
+      for (const state of this.clients.values()) {
+        if (
+          state.socket &&
+          state.socket !== socket &&
+          state.status === "active"
+        ) {
+          this.send(state.socket, online);
+        }
       }
       return;
     }

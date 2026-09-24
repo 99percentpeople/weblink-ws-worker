@@ -26,6 +26,16 @@ flag after membership is stored and before presence or cached signaling is
 replayed. This gives clients an explicit point at which the replacement socket
 is safe to use.
 
+After a retained client's socket resumes, the Worker sends `peer-online` to the
+other currently online members. Its payload is `{ clientId, connectionId }`,
+with a server-assigned socket ID. It uses the shared signaling version reported
+by `joined`; this compatible addition does not introduce or bump a version. This wakes a single client-side
+P2P recovery attempt instead of requiring repeated connection retries. It is not
+a membership leave/join or a guarantee of ICE connectivity. Notifications are
+never cached for offline members, and duplicate joins on the same socket do not
+rebroadcast them. Deploy this server support before the event-driven frontend;
+older frontends safely ignore the new event.
+
 Each room ID maps to one Durable Object, which keeps room state isolated and
 provides a single serialization point for membership changes.
 

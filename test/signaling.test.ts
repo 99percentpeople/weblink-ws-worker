@@ -330,6 +330,31 @@ describe("SignalingRoom", () => {
     });
   });
 
+  it("does not cache transient peer-online notifications for offline members", async () => {
+    const roomId = crypto.randomUUID();
+    const alice = await connect(roomId);
+    const bob = await connect(roomId);
+    await alice.inbox.next();
+    await bob.inbox.next();
+    await join(alice.inbox, client("alice"));
+    await join(bob.inbox, client("bob"));
+    await alice.inbox.next();
+    await bob.inbox.next();
+    alice.inbox.close();
+    bob.inbox.close();
+    await waitForStoredStatus(alice.stub, "alice", "disconnected");
+    await waitForStoredStatus(bob.stub, "bob", "disconnected");
+    const resumed = await connect(roomId);
+    await resumed.inbox.next();
+    await join(resumed.inbox, client("bob", { resume: true }));
+    const stored = await runInDurableObject(
+      alice.stub,
+      async (_instance, state) =>
+        state.storage.get<{ messageCache: RawSignal[] }>("client:alice"),
+    );
+    expect(stored?.messageCache).toEqual([]);
+  });
+
   it("caches signals during the reconnect grace period", async () => {
     const roomId = crypto.randomUUID();
     const alice = await connect(roomId);
@@ -374,6 +399,25 @@ describe("SignalingRoom", () => {
         targetClientId: "bob",
         data: "cached-answer",
       },
+    });
+    expect(await alice.inbox.next()).toEqual({
+      type: "peer-online",
+      data: { clientId: "bob", connectionId: expect.any(String) },
+    });
+    // A duplicate join on the same socket only acknowledges; no second wakeup.
+    await join(resumedBob.inbox, client("bob", { resume: true }));
+    resumedBob.inbox.send({
+      type: "message",
+      data: {
+        type: "offer",
+        clientId: "bob",
+        targetClientId: "alice",
+        data: "after-resume",
+      },
+    });
+    expect(await alice.inbox.next()).toMatchObject({
+      type: "message",
+      data: { data: "after-resume" },
     });
   });
 });
