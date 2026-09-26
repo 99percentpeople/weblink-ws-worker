@@ -4,6 +4,10 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-31",
   "workers_dev": true,
+  "keep_vars": true,
+  "secrets": {
+    "required": ["TURN_KEY_ID", "TURN_KEY_API_TOKEN"],
+  },
   "routes": [
     {
       "pattern": "ws.webl.ink",

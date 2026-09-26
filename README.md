@@ -11,8 +11,8 @@ the WebSocket Hibernation API.
 
 ## Responsibilities
 
-The Worker handles only room membership and the signaling needed to establish
-WebRTC connections:
+The Worker handles room membership and the signaling needed to establish
+WebRTC connections, plus an optional stateless TURN credential endpoint:
 
 - room password metadata
 - `connected`, `join`, versioned `joined`, and `leave` events
@@ -20,6 +20,7 @@ WebRTC connections:
 - same-client reconnects with a 90-second grace period
 - queued signaling messages during that reconnect period
 - hibernatable WebSockets and alarm-based cleanup
+- temporary Cloudflare TURN credential exchange outside Durable Objects
 
 The Worker emits `joined` with signaling protocol version 2 and a `resumed`
 flag after membership is stored and before presence or cached signaling is
@@ -49,6 +50,50 @@ application messages, files, and media are exchanged peer-to-peer over WebRTC.
 The service can still observe room membership, client IDs, and connection
 timing. SDP and ICE signaling payloads pass through the service while peers
 establish WebRTC, but the Weblink frontend encrypts them with the room password.
+
+## Cloudflare TURN credentials
+
+`POST /turn-credentials` exchanges backend-owned Cloudflare TURN configuration
+for short-lived browser credentials. This is a public endpoint: it needs no
+WebSocket upgrade, room, authentication, or rate limiter. The service does not
+relay files or media; Cloudflare TURN carries relayed traffic.
+
+Set `TURN_KEY_ID` and `TURN_KEY_API_TOKEN` using the existing key values.
+The exchange uses Cloudflare's `credentials/generate-ice-servers` API and a fixed
+24-hour TTL. The JSON response is `{ iceServers, expiresAt }`, with `expiresAt`
+in Unix milliseconds. Credentials are not cached or stored by this backend.
+All responses have `Cache-Control: no-store` and `Access-Control-Allow-Origin: *`.
+`OPTIONS` returns 204, unsupported methods 405, unconfigured service 503,
+provider failure 502, and a 10-second upstream timeout 504. Only normalized
+WebRTC fields are returned; provider error details and long-term keys are not.
+
+The frontend discovers this endpoint from the root of its WebSocket origin,
+caches temporary credentials in memory, and refreshes on demand before
+connection/SDP negotiation when expiry is near. A reverse proxy must forward
+`/turn-credentials` as well as the WebSocket route. An unconfigured backend
+continues serving signaling normally; clients can still use custom STUN/TURN.
+
+Remove old `|cloudflare` values from frontend `VITE_TURN_SERVERS`/`PAGES_BUILD_ENV`
+after configuring this endpoint. No automatic key rotation is performed.
+
+Reference: [Cloudflare credential generation](https://developers.cloudflare.com/realtime/turn/generate-credentials/).
+
+For local development, copy the TURN values from `.env.example` into ignored
+`.dev.vars`. For production, manage both values in Cloudflare Dashboard under the Worker's
+**Settings → Variables and Secrets**, using the **Secret** type for each value:
+
+```text
+TURN_KEY_ID
+TURN_KEY_API_TOKEN
+```
+
+`wrangler.jsonc` declares these as required secrets so deployments fail clearly
+when either is missing. It also enables `keep_vars` so plaintext variables added
+through the Dashboard remain managed there instead of being removed by a later
+Wrangler deployment.
+
+The keys belong to this Worker, not to the frontend Pages build or the room
+Durable Object. Deploy the endpoint before publishing the updated frontend.
 
 ## Development
 

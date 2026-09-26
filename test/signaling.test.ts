@@ -122,6 +122,21 @@ afterEach(async () => {
 });
 
 describe("Worker entrypoint", () => {
+  it("routes TURN preflight and method checks without room membership", async () => {
+    const preflight = await workerExports.default.fetch(
+      new Request("https://ws.webl.ink/turn-credentials", {
+        method: "OPTIONS",
+      }),
+    );
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get("access-control-allow-origin")).toBe("*");
+    const get = await workerExports.default.fetch(
+      new Request("https://ws.webl.ink/turn-credentials"),
+    );
+    expect(get.status).toBe(405);
+    expect(get.headers.get("cache-control")).toBe("no-store");
+  });
+
   it("serves health checks and rejects non-WebSocket requests", async () => {
     const health = await workerExports.default.fetch(
       new Request("https://ws.webl.ink/healthcheck"),
