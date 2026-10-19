@@ -4,12 +4,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RawSignal, TransferClient } from "../src/protocol";
 
 class SocketInbox {
+  challenge = "";
   private readonly queued: RawSignal[] = [];
   private readonly waiting: Array<(signal: RawSignal) => void> = [];
 
   constructor(readonly socket: WebSocket) {
     socket.addEventListener("message", (event) => {
       const signal = JSON.parse(String(event.data)) as RawSignal;
+      if (signal.type === "connected")
+        this.challenge = (
+          signal as RawSignal & { identityChallenge: string }
+        ).identityChallenge;
       const resolve = this.waiting.shift();
       if (resolve) {
         resolve(signal);
@@ -87,7 +92,44 @@ async function connect(
   return { inbox, stub };
 }
 
+const keys = new Map<string, CryptoKeyPair>();
+async function signed(
+  inbox: SocketInbox,
+  value: TransferClient,
+  keyId = value.clientId,
+) {
+  let key = keys.get(keyId);
+  if (!key) {
+    key = (await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["sign", "verify"],
+    )) as CryptoKeyPair;
+    keys.set(keyId, key);
+  }
+  const b64 = (b: ArrayBuffer) =>
+    btoa(String.fromCharCode(...new Uint8Array(b)));
+  const publicKey = b64(
+    (await crypto.subtle.exportKey("raw", key.publicKey)) as ArrayBuffer,
+  );
+  const signature = b64(
+    await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      key.privateKey,
+      new TextEncoder().encode(
+        JSON.stringify([
+          "weblink-signaling-identity/1",
+          inbox.challenge,
+          value.clientId,
+          value.createdAt,
+        ]),
+      ),
+    ),
+  );
+  return { ...value, identityProof: { publicKey, signature } };
+}
 async function join(inbox: SocketInbox, value: unknown): Promise<RawSignal> {
+  value = await signed(inbox, value as TransferClient);
   inbox.send({ type: "join", data: value });
   const acknowledgement = await inbox.next();
   expect(acknowledgement).toMatchObject({
@@ -157,6 +199,7 @@ describe("SignalingRoom", () => {
     const alice = await connect(roomId, "password-hash");
     expect(await alice.inbox.next()).toEqual({
       type: "connected",
+      identityChallenge: expect.any(String),
       data: "password-hash",
     });
     await join(alice.inbox, {
@@ -168,6 +211,7 @@ describe("SignalingRoom", () => {
     const bob = await connect(roomId, "different-hash");
     expect(await bob.inbox.next()).toEqual({
       type: "connected",
+      identityChallenge: expect.any(String),
       data: "password-hash",
     });
     await join(bob.inbox, {
@@ -434,5 +478,77 @@ describe("SignalingRoom", () => {
       type: "message",
       data: { data: "after-resume" },
     });
+  });
+});
+
+it("ignores unsigned, wrong-key and replayed duplicate IDs without evicting the authenticated device", async () => {
+  const room = crypto.randomUUID();
+  const { inbox: owner } = await connect(room),
+    { inbox: peer } = await connect(room);
+  await owner.next();
+  await peer.next();
+  const presence = client("real-device");
+  const original = await signed(owner, presence);
+  await join(owner, presence);
+  await join(peer, client("observer"));
+  await owner.next();
+  await peer.next();
+  for (const attack of [
+    "unsigned",
+    "wrong-key",
+    "replay",
+    "wrong-key",
+    "replay",
+    "wrong-key",
+  ]) {
+    const { inbox: candidate } = await connect(room);
+    await candidate.next();
+    candidate.send({
+      type: "join",
+      data:
+        attack === "unsigned"
+          ? presence
+          : attack === "replay"
+            ? original
+            : await signed(candidate, presence, "attacker"),
+    });
+    expect(await candidate.next()).toMatchObject({
+      type: "error",
+      data: "DUPLICATE_DEVICE_ID",
+    });
+    owner.send({
+      type: "message",
+      data: {
+        type: "candidate",
+        clientId: "real-device",
+        targetClientId: "observer",
+        data: attack,
+      },
+    });
+    expect(await peer.next()).toMatchObject({
+      type: "message",
+      data: { data: attack },
+    });
+    expect(owner.socket.readyState).toBe(WebSocket.OPEN);
+  }
+  owner.send({ type: "leave", data: null });
+  expect(await peer.next()).toMatchObject({
+    type: "leave",
+    data: { clientId: "real-device" },
+  });
+  const { inbox: recovered } = await connect(room);
+  await recovered.next();
+  recovered.send({
+    type: "join",
+    data: await signed(recovered, presence, "regenerated-device"),
+  });
+  expect(await recovered.next()).toMatchObject({ type: "joined" });
+  expect(await recovered.next()).toMatchObject({
+    type: "join",
+    data: { clientId: "observer" },
+  });
+  expect(await peer.next()).toMatchObject({
+    type: "join",
+    data: { clientId: "real-device" },
   });
 });

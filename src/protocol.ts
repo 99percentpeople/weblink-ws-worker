@@ -11,6 +11,7 @@ export interface TransferClient {
 export interface RawSignal<T = unknown> {
   type: string;
   data: T;
+  identityChallenge?: string;
 }
 
 export interface ClientSignal extends RawSignal {

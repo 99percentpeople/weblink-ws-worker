@@ -1,3 +1,4 @@
+import { verifyJoinIdentity, mayReplace } from "./device-identity";
 import { DurableObject } from "cloudflare:workers";
 import {
   createJoinAcknowledgement,
@@ -22,6 +23,7 @@ interface RoomMeta {
 }
 
 interface StoredClientState {
+  identityKey?: string;
   client: TransferClient;
   status: "active" | "disconnected";
   expiresAt: number | null;
@@ -195,6 +197,7 @@ export class SignalingRoom extends DurableObject<Env> {
     this.send(server, {
       type: "connected",
       data: this.roomMeta.passwordHash,
+      identityChallenge: this.getAttachment(server).connectionId,
     });
 
     return new Response(null, {
@@ -269,6 +272,19 @@ export class SignalingRoom extends DurableObject<Env> {
       return;
     }
 
+    const identityKey = await verifyJoinIdentity(
+      connectionId,
+      client.clientId,
+      client.createdAt,
+      value && typeof value === "object"
+        ? (value as Record<string, unknown>).identityProof
+        : undefined,
+    );
+    if (existing && !mayReplace(existing.identityKey, identityKey)) {
+      this.sendError(socket, "DUPLICATE_DEVICE_ID");
+      socket.close(1008, "Duplicate device ID");
+      return;
+    }
     if (existing && client.resume) {
       if (existing.socket && existing.socket !== socket) {
         existing.socket.close(1000, "Session resumed elsewhere");
@@ -276,6 +292,7 @@ export class SignalingRoom extends DurableObject<Env> {
 
       const cachedSignals = existing.messageCache;
       const resumed: ClientState = {
+        identityKey,
         client,
         socket,
         connectionId,
@@ -327,6 +344,7 @@ export class SignalingRoom extends DurableObject<Env> {
 
     const currentClients = [...this.clients.values()];
     const joined: ClientState = {
+      identityKey,
       client,
       socket,
       connectionId,
@@ -538,6 +556,8 @@ export class SignalingRoom extends DurableObject<Env> {
 
   private async persistClient(state: ClientState): Promise<void> {
     const stored: StoredClientState = {
+      identityKey: state.identityKey,
+      connectionId: state.connectionId,
       client: state.client,
       status: state.status,
       expiresAt: state.expiresAt,
