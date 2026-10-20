@@ -280,6 +280,14 @@ export class SignalingRoom extends DurableObject<Env> {
         ? (value as Record<string, unknown>).identityProof
         : undefined,
     );
+    if (
+      (value as Record<string, unknown>).identityProof !== undefined &&
+      !identityKey
+    ) {
+      this.sendError(socket, "INVALID_DEVICE_PROOF");
+      socket.close(1008, "Invalid device proof");
+      return;
+    }
     if (existing && !mayReplace(existing.identityKey, identityKey)) {
       this.sendError(socket, "DUPLICATE_DEVICE_ID");
       socket.close(1008, "Duplicate device ID");
