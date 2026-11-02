@@ -40,6 +40,33 @@ older frontends safely ignore the new event.
 Each room ID maps to one Durable Object, which keeps room state isolated and
 provides a single serialization point for membership changes.
 
+## WebSocket admission and room privacy
+
+The entrypoint uses Cloudflare's `WS_CONNECT_LIMITER` binding (60 WebSocket
+upgrades per source IP per 60 seconds, configurable in `wrangler.jsonc`).
+It checks the Cloudflare-provided `CF-Connecting-IP` before routing to the
+room Durable Object; caller-supplied `X-Forwarded-For` is not trusted.
+This check **does not apply to** `/turn-credentials`, which stays public.
+
+A WebSocket handshake no longer writes `room:meta` or commits a password
+verifier. The first valid `join` installs room metadata, while any socket that
+fails to join within 15 seconds is closed by the Durable Object alarm. Rooms
+are capped at 128 retained members, including disconnected members awaiting
+the normal 90-second resume period. Existing `connected` / `joined` response
+shapes and frontend-only password validation remain unchanged.
+
+Cloudflare Rate Limiting API counters are **approximate and per Cloudflare
+location**, not strict global quotas. Multiple users behind a shared NAT IP
+share the same limit. If traffic warrants it, add Cloudflare WAF rules and/or
+a stricter per-IP Durable Object limiter; avoid relying on this binding for
+absolute global caps.
+
+There is no public room-list API. However, the current client-side password
+protocol intentionally exposes a room password verifier on `connected` and
+peer presence after joining. A party who can guess or obtain a room ID can
+probe it; to mitigate enumeration, use cryptographically unpredictable room
+IDs and tightly restrict access to access logs, traces and analytics.
+
 ## Privacy boundary
 
 Presence records contain only `clientId`, `createdAt`, the RTC profile protocol
