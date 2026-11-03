@@ -190,6 +190,10 @@ export class SignalingRoom extends DurableObject<Env> {
       }
     }
     await Promise.all(writes);
+    if (this.roomMeta && this.clients.size === 0) {
+      await this.cleanupEmptyRoom();
+      return;
+    }
     await this.scheduleNextAlarm();
   }
 
@@ -264,6 +268,7 @@ export class SignalingRoom extends DurableObject<Env> {
   }
 
   private async handleJoin(socket: WebSocket, value: unknown): Promise<void> {
+    if (socket.readyState !== WebSocket.OPEN) return;
     const client = parseTransferClient(value);
     if (!client) {
       this.sendError(socket, "Invalid client");
@@ -651,15 +656,22 @@ export class SignalingRoom extends DurableObject<Env> {
       await this.ctx.storage.deleteAlarm();
       return;
     }
-    await this.ctx.storage.setAlarm(nextAlarm);
+    if ((await this.ctx.storage.getAlarm()) !== nextAlarm) {
+      await this.ctx.storage.setAlarm(nextAlarm);
+    }
   }
 
   private async cleanupEmptyRoom(): Promise<void> {
     if (this.clients.size > 0) return;
-    const hasOpenSocket = this.ctx
+    const openSockets = this.ctx
       .getWebSockets()
-      .some((socket) => socket.readyState === WebSocket.OPEN);
-    if (hasOpenSocket) return;
+      .filter((socket) => socket.readyState === WebSocket.OPEN);
+    // In a new room each pending handshake can still become the first member.
+    if (!this.roomMeta && openSockets.length > 0) return;
+    for (const socket of openSockets) {
+      // Its handshake advertised the expired room's verifier.
+      socket.close(1013, "Room expired, reconnect");
+    }
 
     this.roomMeta = null;
     await this.ctx.storage.deleteAll();

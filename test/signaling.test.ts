@@ -224,6 +224,87 @@ describe("Worker entrypoint", () => {
 });
 
 describe("SignalingRoom", () => {
+  it.each(["leave", "grace expiry"])(
+    "clears the last member's room despite a pending handshake (%s)",
+    async (exit) => {
+      const roomId = crypto.randomUUID();
+      const { inbox: owner, stub } = await connect(roomId, "old-hash");
+      await owner.next();
+      await join(owner, client("owner"));
+      if (exit === "grace expiry") {
+        owner.close();
+        await waitForStoredStatus(stub, "owner", "disconnected");
+      }
+
+      const { inbox: pending } = await connect(roomId, "next-hash");
+      expect((await pending.next()).data).toBe("old-hash");
+      if (exit === "leave") {
+        owner.send({ type: "leave", data: undefined });
+      } else {
+        // Wake the object with an expired member and a still-fresh handshake.
+        await runInDurableObject(stub, async (_instance, state) => {
+          const member =
+            await state.storage.get<Record<string, unknown>>("client:owner");
+          await state.storage.put("client:owner", {
+            ...member,
+            expiresAt: Date.now() - 1,
+          });
+        });
+        await evictDurableObject(stub);
+        await runInDurableObject(stub, async (instance) => {
+          if (!instance.alarm) throw new Error("Missing room alarm");
+          await instance.alarm();
+        });
+      }
+
+      await vi.waitFor(async () => {
+        const stored = await runInDurableObject(
+          stub,
+          async (_instance, state) => ({
+            keys: [...(await state.storage.list()).keys()],
+            alarm: await state.storage.getAlarm(),
+          }),
+        );
+        expect(stored).toEqual({ keys: [], alarm: null });
+        expect(pending.socket.readyState).toBe(WebSocket.CLOSED);
+      });
+      const { inbox: fresh } = await connect(roomId, "next-hash");
+      expect((await fresh.next()).data).toBe("next-hash");
+      await join(fresh, client("next"));
+    },
+  );
+
+  it("discards orphaned room metadata on wake", async () => {
+    const roomId = crypto.randomUUID();
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(roomId));
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put("room:meta", { passwordHash: "old-hash" });
+    });
+    await evictDurableObject(stub);
+    const { inbox } = await connect(roomId, "new-hash");
+    expect((await inbox.next()).data).toBe("new-hash");
+    await join(inbox, client("first"));
+  });
+
+  it("lets another pending socket create a room if nobody has joined yet", async () => {
+    const roomId = crypto.randomUUID();
+    const { inbox: abandoned } = await connect(roomId);
+    const { inbox: creator, stub } = await connect(roomId, "new-hash");
+    await abandoned.next();
+    await creator.next();
+    abandoned.close();
+    await vi.waitFor(async () => {
+      const open = await runInDurableObject(
+        stub,
+        async (_instance, state) =>
+          state.getWebSockets().filter((s) => s.readyState === WebSocket.OPEN)
+            .length,
+      );
+      expect(open).toBe(1);
+    });
+    await join(creator, client("creator"));
+  });
+
   it.each(["", "owner-hash"])(
     "requires a fresh handshake when another verifier wins (owner=%s)",
     async (ownerHash) => {
