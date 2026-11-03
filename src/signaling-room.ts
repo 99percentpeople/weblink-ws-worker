@@ -17,6 +17,8 @@ import {
 const ROOM_META_KEY = "room:meta";
 const CLIENT_KEY_PREFIX = "client:";
 const DISCONNECT_TIMEOUT_MS = 90_000;
+const JOIN_TIMEOUT_MS = 15_000;
+const MAX_ROOM_CLIENTS = 128;
 
 interface RoomMeta {
   passwordHash: string | null;
@@ -38,6 +40,9 @@ interface ClientState extends StoredClientState {
 interface SocketAttachment {
   clientId?: ClientID;
   connectionId?: string;
+  // Only pending sockets carry the initial hash and an admission deadline.
+  handshakePasswordHash?: string | null;
+  joinDeadline?: number;
 }
 
 export class SignalingRoom extends DurableObject<Env> {
@@ -128,7 +133,19 @@ export class SignalingRoom extends DurableObject<Env> {
       const attachment =
         socket.deserializeAttachment() as SocketAttachment | null;
       const clientId = attachment?.clientId;
-      if (!clientId) continue;
+      if (!clientId) {
+        // Upgrade sockets created before this release as well.
+        if (!attachment?.joinDeadline) {
+          socket.serializeAttachment({
+            ...attachment,
+            connectionId: attachment?.connectionId ?? crypto.randomUUID(),
+            // Older handshakes sent the persisted room verifier.
+            handshakePasswordHash: this.roomMeta?.passwordHash,
+            joinDeadline: Date.now() + JOIN_TIMEOUT_MS,
+          } satisfies SocketAttachment);
+        }
+        continue;
+      }
 
       const state = this.clients.get(clientId);
       if (!state) {
@@ -182,23 +199,25 @@ export class SignalingRoom extends DurableObject<Env> {
     }
 
     const url = new URL(request.url);
-    if (!this.roomMeta) {
-      this.roomMeta = {
-        passwordHash: url.searchParams.get("pwd") || null,
-      };
-      await this.ctx.storage.put(ROOM_META_KEY, this.roomMeta);
-    }
+    const handshakePasswordHash = this.roomMeta
+      ? this.roomMeta.passwordHash
+      : url.searchParams.get("pwd") || null;
 
+    // Do not persist an empty room on handshake. Only an admitted join may
+    // establish room metadata, after device proof and capacity checks.
     const [client, server] = Object.values(new WebSocketPair());
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment({
       connectionId: crypto.randomUUID(),
+      handshakePasswordHash,
+      joinDeadline: Date.now() + JOIN_TIMEOUT_MS,
     } satisfies SocketAttachment);
     this.send(server, {
       type: "connected",
-      data: this.roomMeta.passwordHash,
+      data: handshakePasswordHash,
       identityChallenge: this.getAttachment(server).connectionId,
     });
+    await this.scheduleNextAlarm();
 
     return new Response(null, {
       status: 101,
@@ -292,6 +311,25 @@ export class SignalingRoom extends DurableObject<Env> {
       this.sendError(socket, "DUPLICATE_DEVICE_ID");
       socket.close(1008, "Duplicate device ID");
       return;
+    }
+    if (!existing && this.clients.size >= MAX_ROOM_CLIENTS) {
+      this.sendError(socket, "Room capacity reached");
+      socket.close(1008, "Room capacity reached");
+      return;
+    }
+    // The client validated the verifier in its connected frame. A concurrent
+    // first join may have established a different verifier in the meantime.
+    const { handshakePasswordHash } = attachment;
+    if (
+      handshakePasswordHash === undefined ||
+      (this.roomMeta && this.roomMeta.passwordHash !== handshakePasswordHash)
+    ) {
+      socket.close(1013, "Room changed, reconnect");
+      return;
+    }
+    if (!this.roomMeta) {
+      this.roomMeta = { passwordHash: handshakePasswordHash };
+      await this.ctx.storage.put(ROOM_META_KEY, this.roomMeta);
     }
     if (existing && client.resume) {
       if (existing.socket && existing.socket !== socket) {
@@ -456,6 +494,18 @@ export class SignalingRoom extends DurableObject<Env> {
 
   private async expireDisconnectedClients(): Promise<void> {
     const now = Date.now();
+    // Hibernating unjoined sockets must never pin empty rooms indefinitely.
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = this.getAttachment(socket);
+      if (
+        !attachment.clientId &&
+        attachment.joinDeadline !== undefined &&
+        attachment.joinDeadline <= now &&
+        socket.readyState === WebSocket.OPEN
+      ) {
+        socket.close(1008, "Join timeout");
+      }
+    }
     const expired: ClientState[] = [];
 
     for (const [clientId, state] of this.clients) {
@@ -576,6 +626,19 @@ export class SignalingRoom extends DurableObject<Env> {
 
   private async scheduleNextAlarm(): Promise<void> {
     let nextAlarm: number | null = null;
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = this.getAttachment(socket);
+      if (
+        !attachment.clientId &&
+        attachment.joinDeadline !== undefined &&
+        socket.readyState === WebSocket.OPEN
+      ) {
+        nextAlarm =
+          nextAlarm === null
+            ? attachment.joinDeadline
+            : Math.min(nextAlarm, attachment.joinDeadline);
+      }
+    }
     for (const state of this.clients.values()) {
       if (state.status !== "disconnected" || state.expiresAt === null) continue;
       nextAlarm =

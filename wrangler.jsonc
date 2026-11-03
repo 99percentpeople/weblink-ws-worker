@@ -8,6 +8,18 @@
   "secrets": {
     "required": ["TURN_KEY_ID", "TURN_KEY_API_TOKEN"],
   },
+  // Admission gate for WebSocket upgrades only, not /turn-credentials.
+  // Approximate per-Cloudflare-location rate; namespace_id must be unique per account.
+  "ratelimits": [
+    {
+      "name": "WS_CONNECT_LIMITER",
+      "namespace_id": "710001",
+      "simple": {
+        "limit": 60,
+        "period": 60,
+      },
+    },
+  ],
   "routes": [
     {
       "pattern": "ws.webl.ink",

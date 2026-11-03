@@ -41,6 +41,19 @@ export default {
       return new Response("Invalid password hash", { status: 400 });
     }
 
+    // Enforce admission before instantiating a room Durable Object.
+    // Cloudflare injects CF-Connecting-IP; do not trust user X-Forwarded-For.
+    const clientIp = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    const { success } = await env.WS_CONNECT_LIMITER.limit({
+      key: `websocket:${clientIp}`,
+    });
+    if (!success) {
+      return new Response("Too many WebSocket connections", {
+        status: 429,
+        headers: { "retry-after": "60", "cache-control": "no-store" },
+      });
+    }
+
     const id = env.ROOMS.idFromName(roomId);
     return env.ROOMS.get(id).fetch(request);
   },

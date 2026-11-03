@@ -2,6 +2,7 @@ import { env, exports as workerExports } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RawSignal, TransferClient } from "../src/protocol";
+import worker from "../src/index";
 
 class SocketInbox {
   challenge = "";
@@ -168,6 +169,31 @@ afterEach(async () => {
 });
 
 describe("Worker entrypoint", () => {
+  it("rejects excess WebSocket connections before touching the room store", async () => {
+    const limit = vi.fn(async () => ({ success: false }));
+    const response = await worker.fetch(
+      new Request("https://ws.webl.ink/?room=hidden-room", {
+        headers: {
+          Upgrade: "websocket",
+          "CF-Connecting-IP": "192.0.2.15",
+        },
+      }),
+      { WS_CONNECT_LIMITER: { limit } } as unknown as Env,
+    );
+    expect(response.status).toBe(429);
+    expect(limit).toHaveBeenCalledWith({ key: "websocket:192.0.2.15" });
+    expect(response.headers.get("retry-after")).toBe("60");
+  });
+
+  it("does not subject the intentionally public TURN route to WS limits", async () => {
+    const response = await worker.fetch(
+      new Request("https://ws.webl.ink/turn-credentials", {
+        method: "OPTIONS",
+      }),
+      {} as Env,
+    );
+    expect(response.status).toBe(204);
+  });
   it("routes TURN preflight and method checks without room membership", async () => {
     const preflight = await workerExports.default.fetch(
       new Request("https://ws.webl.ink/turn-credentials", {
@@ -198,6 +224,83 @@ describe("Worker entrypoint", () => {
 });
 
 describe("SignalingRoom", () => {
+  it.each(["", "owner-hash"])(
+    "requires a fresh handshake when another verifier wins (owner=%s)",
+    async (ownerHash) => {
+      const room = crypto.randomUUID();
+      const pending = (await connect(room, ownerHash ? "" : "pending-hash"))
+        .inbox;
+      expect((await pending.next()).data).toBe(
+        ownerHash ? null : "pending-hash",
+      );
+      const owner = (await connect(room, ownerHash)).inbox;
+      expect((await owner.next()).data).toBe(ownerHash || null);
+      await join(owner, client("owner"));
+      const closed = new Promise<CloseEvent>((resolve) =>
+        pending.socket.addEventListener("close", resolve, { once: true }),
+      );
+      pending.send({ type: "join", data: client("late") });
+      expect((await closed).code).toBe(1013);
+
+      const retry = (await connect(room, "new-salted-hash")).inbox;
+      expect((await retry.next()).data).toBe(ownerHash || null);
+      await join(retry, client("late"));
+    },
+  );
+
+  it("does not store a room until a valid join, including across multiple handshakes", async () => {
+    const roomId = crypto.randomUUID();
+    const first = await connect(roomId, "unjoined-hash");
+    expect(await first.inbox.next()).toMatchObject({
+      type: "connected",
+      data: "unjoined-hash",
+    });
+    const before = await runInDurableObject(
+      first.stub,
+      async (_instance, state) => state.storage.get("room:meta"),
+    );
+    expect(before).toBeUndefined();
+
+    const owner = await connect(roomId, "joined-hash");
+    expect(await owner.inbox.next()).toMatchObject({
+      type: "connected",
+      data: "joined-hash",
+    });
+    await join(owner.inbox, client("joined-owner"));
+    const after = await runInDurableObject(
+      first.stub,
+      async (_instance, state) =>
+        state.storage.get<{ passwordHash: string | null }>("room:meta"),
+    );
+    expect(after?.passwordHash).toBe("joined-hash");
+
+    const later = await connect(roomId, "third-hash");
+    expect(await later.inbox.next()).toMatchObject({
+      type: "connected",
+      data: "joined-hash",
+    });
+  });
+
+  it("expires idle unjoined WebSockets", async () => {
+    const { inbox, stub } = await connect(crypto.randomUUID());
+    await inbox.next();
+    await runInDurableObject(stub, async (instance, state) => {
+      const socket = state.getWebSockets()[0]!;
+      const attachment = socket.deserializeAttachment() as Record<
+        string,
+        unknown
+      >;
+      socket.serializeAttachment({
+        ...attachment,
+        joinDeadline: Date.now() - 1,
+      });
+      if (!instance.alarm) throw new Error("Durable Object alarm missing");
+      await instance.alarm();
+    });
+    await vi.waitFor(() => {
+      expect(inbox.socket.readyState).toBe(WebSocket.CLOSED);
+    });
+  });
   it("keeps the first room password and strips profile fields", async () => {
     const roomId = crypto.randomUUID();
     const alice = await connect(roomId, "password-hash");
