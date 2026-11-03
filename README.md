@@ -55,6 +55,11 @@ are capped at 128 retained members, including disconnected members awaiting
 the normal 90-second resume period. Existing `connected` / `joined` response
 shapes and frontend-only password validation remain unchanged.
 
+After the last member leaves explicitly or their reconnect window expires,
+the Worker deletes the room verifier and stored member data. Pending handshakes
+cannot extend that window. Sockets that received the expired room's verifier
+close with code 1013 and can reconnect to start a fresh room.
+
 If another client establishes a different verifier between `connected` and
 `join`, the pending socket closes with code 1013. Reconnect to validate the
 verifier sent in the new handshake. An established public room sends `null`.
