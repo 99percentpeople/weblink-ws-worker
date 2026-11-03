@@ -224,6 +224,30 @@ describe("Worker entrypoint", () => {
 });
 
 describe("SignalingRoom", () => {
+  it.each(["", "owner-hash"])(
+    "requires a fresh handshake when another verifier wins (owner=%s)",
+    async (ownerHash) => {
+      const room = crypto.randomUUID();
+      const pending = (await connect(room, ownerHash ? "" : "pending-hash"))
+        .inbox;
+      expect((await pending.next()).data).toBe(
+        ownerHash ? null : "pending-hash",
+      );
+      const owner = (await connect(room, ownerHash)).inbox;
+      expect((await owner.next()).data).toBe(ownerHash || null);
+      await join(owner, client("owner"));
+      const closed = new Promise<CloseEvent>((resolve) =>
+        pending.socket.addEventListener("close", resolve, { once: true }),
+      );
+      pending.send({ type: "join", data: client("late") });
+      expect((await closed).code).toBe(1013);
+
+      const retry = (await connect(room, "new-salted-hash")).inbox;
+      expect((await retry.next()).data).toBe(ownerHash || null);
+      await join(retry, client("late"));
+    },
+  );
+
   it("does not store a room until a valid join, including across multiple handshakes", async () => {
     const roomId = crypto.randomUUID();
     const first = await connect(roomId, "unjoined-hash");

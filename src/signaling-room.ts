@@ -41,7 +41,7 @@ interface SocketAttachment {
   clientId?: ClientID;
   connectionId?: string;
   // Only pending sockets carry the initial hash and an admission deadline.
-  requestedPasswordHash?: string | null;
+  handshakePasswordHash?: string | null;
   joinDeadline?: number;
 }
 
@@ -139,6 +139,8 @@ export class SignalingRoom extends DurableObject<Env> {
           socket.serializeAttachment({
             ...attachment,
             connectionId: attachment?.connectionId ?? crypto.randomUUID(),
+            // Older handshakes sent the persisted room verifier.
+            handshakePasswordHash: this.roomMeta?.passwordHash,
             joinDeadline: Date.now() + JOIN_TIMEOUT_MS,
           } satisfies SocketAttachment);
         }
@@ -197,7 +199,9 @@ export class SignalingRoom extends DurableObject<Env> {
     }
 
     const url = new URL(request.url);
-    const requestedPasswordHash = url.searchParams.get("pwd") || null;
+    const handshakePasswordHash = this.roomMeta
+      ? this.roomMeta.passwordHash
+      : url.searchParams.get("pwd") || null;
 
     // Do not persist an empty room on handshake. Only an admitted join may
     // establish room metadata, after device proof and capacity checks.
@@ -205,12 +209,12 @@ export class SignalingRoom extends DurableObject<Env> {
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment({
       connectionId: crypto.randomUUID(),
-      requestedPasswordHash,
+      handshakePasswordHash,
       joinDeadline: Date.now() + JOIN_TIMEOUT_MS,
     } satisfies SocketAttachment);
     this.send(server, {
       type: "connected",
-      data: this.roomMeta?.passwordHash ?? requestedPasswordHash,
+      data: handshakePasswordHash,
       identityChallenge: this.getAttachment(server).connectionId,
     });
     await this.scheduleNextAlarm();
@@ -313,10 +317,18 @@ export class SignalingRoom extends DurableObject<Env> {
       socket.close(1008, "Room capacity reached");
       return;
     }
+    // The client validated the verifier in its connected frame. A concurrent
+    // first join may have established a different verifier in the meantime.
+    const { handshakePasswordHash } = attachment;
+    if (
+      handshakePasswordHash === undefined ||
+      (this.roomMeta && this.roomMeta.passwordHash !== handshakePasswordHash)
+    ) {
+      socket.close(1013, "Room changed, reconnect");
+      return;
+    }
     if (!this.roomMeta) {
-      this.roomMeta = {
-        passwordHash: attachment.requestedPasswordHash || null,
-      };
+      this.roomMeta = { passwordHash: handshakePasswordHash };
       await this.ctx.storage.put(ROOM_META_KEY, this.roomMeta);
     }
     if (existing && client.resume) {

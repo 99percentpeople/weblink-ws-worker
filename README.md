@@ -55,6 +55,10 @@ are capped at 128 retained members, including disconnected members awaiting
 the normal 90-second resume period. Existing `connected` / `joined` response
 shapes and frontend-only password validation remain unchanged.
 
+If another client establishes a different verifier between `connected` and
+`join`, the pending socket closes with code 1013. Reconnect to validate the
+verifier sent in the new handshake. An established public room sends `null`.
+
 Cloudflare Rate Limiting API counters are **approximate and per Cloudflare
 location**, not strict global quotas. Multiple users behind a shared NAT IP
 share the same limit. If traffic warrants it, add Cloudflare WAF rules and/or
